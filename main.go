@@ -21,6 +21,7 @@ func main() {
 	commands := map[string]func() error{
 		"init":    cmdInit,
 		"sync":    cmdSync,
+		"diff":    cmdDiff,
 		"status":  cmdStatus,
 		"history": cmdHistory,
 		"log":     cmdLog,
@@ -60,6 +61,8 @@ Commands:
   version             Show version
   sync                Sync all jobs from YAML config to Jenkins
   sync <job>          Sync specified job
+  diff                Show config differences (local YAML vs Jenkins)
+  diff <job>          Show diff for specified job
   status              Show all job config summary (from local YAML)
   status <job>        Show job config XML (from Jenkins)
   history             Show all jobs last build status

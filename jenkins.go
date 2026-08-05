@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/bndr/gojenkins"
@@ -351,4 +353,119 @@ func cmdDelete() error {
 	}
 	fmt.Printf("deleted: %s\n", name)
 	return nil
+}
+
+func cmdDiff() error {
+	c, err := newJCli()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Connected to Jenkins %s\n", c.jenkins.Server)
+
+	args := os.Args[2:]
+	jobs, err := parseConfigs()
+	if err != nil {
+		return err
+	}
+
+	if len(args) > 0 {
+		target := args[0]
+		var found *Job
+		for i := range jobs {
+			if jobs[i].Name == target {
+				found = &jobs[i]
+				break
+			}
+		}
+		if found == nil {
+			return fmt.Errorf("job '%s' not found in config", target)
+		}
+		return c.diffJob(*found)
+	}
+
+	changed := 0
+	upToDate := 0
+	newJobs := 0
+	for _, j := range jobs {
+		localXML := generateJobXML(j)
+		remoteXML, err := c.getRemoteXML(j.Name)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "404") {
+				fmt.Printf("+ %s (new - not on Jenkins)\n", j.Name)
+				newJobs++
+				continue
+			}
+			fmt.Printf("? %s (error: %v)\n", j.Name, err)
+			continue
+		}
+		if localXML == remoteXML {
+			upToDate++
+			continue
+		}
+		changed++
+		fmt.Printf("\n=== %s ===\n%s", j.Name, unifiedDiff(remoteXML, localXML, j.Name))
+	}
+
+	fmt.Printf("\nSummary: %d up to date, %d changed, %d new\n", upToDate, changed, newJobs)
+	return nil
+}
+
+func (c *JCli) diffJob(j Job) error {
+	localXML := generateJobXML(j)
+	remoteXML, err := c.getRemoteXML(j.Name)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "404") {
+			fmt.Printf("+ %s (new - not on Jenkins)\n", j.Name)
+			return nil
+		}
+		return fmt.Errorf("fetch remote config for %s: %w", j.Name, err)
+	}
+	if localXML == remoteXML {
+		fmt.Printf("%s: up to date\n", j.Name)
+		return nil
+	}
+	fmt.Println(unifiedDiff(remoteXML, localXML, j.Name))
+	return nil
+}
+
+func (c *JCli) getRemoteXML(name string) (string, error) {
+	job, err := c.jenkins.GetJob(c.ctx, name)
+	if err != nil {
+		return "", err
+	}
+	return job.GetConfig(c.ctx)
+}
+
+func unifiedDiff(old, new, name string) string {
+	oldFile, err := writeTemp(old, "jenkins-cli-old-")
+	if err != nil {
+		return fmt.Sprintf("(diff error: %v)\n", err)
+	}
+	defer os.Remove(oldFile)
+
+	newFile, err := writeTemp(new, "jenkins-cli-new-")
+	if err != nil {
+		return fmt.Sprintf("(diff error: %v)\n", err)
+	}
+	defer os.Remove(newFile)
+
+	cmd := exec.Command("diff", "-u", "--label", "jenkins/"+name, oldFile, "--label", "local/"+name, newFile)
+	out, _ := cmd.Output()
+	// diff exits with code 1 when files differ
+	if len(out) == 0 {
+		return ""
+	}
+	return string(out)
+}
+
+func writeTemp(content, prefix string) (string, error) {
+	f, err := os.CreateTemp("", prefix)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := f.WriteString(content); err != nil {
+		return "", err
+	}
+	return f.Name(), nil
 }
