@@ -1,0 +1,72 @@
+name: Dev Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          EXT=""
+          [ "$GOOS" = "windows" ] && EXT=".exe"
+          BINARY="jenkins-cli${EXT}"
+          CGO_ENABLED=0 go build -ldflags="-s -w -X main.Version=dev-${SHORT_SHA}" -o "$BINARY" .
+          ARCHIVE="jenkins-cli_dev-${SHORT_SHA}_${GOOS}_${GOARCH}.tar.gz"
+          tar czf "$ARCHIVE" "$BINARY"
+          echo "archive=${ARCHIVE}" >> $GITHUB_ENV
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ env.archive }}
+
+  release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          SHORT_SHA=$(echo *.tar.gz | head -1 | grep -oP 'dev-\K[0-9a-f]+' || git -C $GITHUB_WORKSPACE rev-parse --short HEAD)
+          sha256sum *.tar.gz > checksums_dev-${SHORT_SHA}.txt
+          echo "sha=${SHORT_SHA}" >> $GITHUB_ENV
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: dev-${{ env.sha }}
+          tag_name: dev-${{ env.sha }}
+          prerelease: true
+          files: dist/*
+          generate_release_notes: true

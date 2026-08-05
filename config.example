@@ -1,0 +1,7 @@
+# Jenkins CLI config (~/.jenkinscli/config)
+# Priority: this file > env vars > defaults
+
+JENKINS_API=https://jenkins.home.daozzg.com
+JENKINS_USER=admin
+JENKINS_PASSWORD=<your-jenkins-token>
+CONFIG_DIR=/root/code/gitops/jenkins/config/*.yaml
