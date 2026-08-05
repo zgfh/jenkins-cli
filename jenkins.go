@@ -32,30 +32,50 @@ func newJCli() (*JCli, error) {
 
 func (c *JCli) hasJob(name string) bool {
 	_, err := c.jenkins.GetJob(c.ctx, name)
-	return err == nil
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  [debug] hasJob(%s) error: %v, assuming not found\n", name, err)
+		return false
+	}
+	return true
 }
 
 func (c *JCli) syncJob(j Job) error {
 	xml := generateJobXML(j)
-	exists := c.hasJob(j.Name)
-	if !exists {
-		_, err := c.jenkins.CreateJob(c.ctx, xml, j.Name)
+	name := j.Name
+
+	if c.hasJob(name) {
+		fmt.Fprintf(os.Stderr, "  %s: updating existing job...\n", name)
+		c.jenkins.UpdateJob(c.ctx, name, xml)
+		fmt.Fprintf(os.Stderr, "  %s: config updated\n", name)
+	} else {
+		fmt.Fprintf(os.Stderr, "  %s: creating new job...\n", name)
+		_, err := c.jenkins.CreateJob(c.ctx, xml, name)
 		if err != nil {
-			return fmt.Errorf("create job %s: %w", j.Name, err)
+			fmt.Fprintf(os.Stderr, "  %s: create failed (%v), trying update...\n", name, err)
+			c.jenkins.UpdateJob(c.ctx, name, xml)
+		}
+		fmt.Fprintf(os.Stderr, "  %s: job created/updated\n", name)
+	}
+
+	job, err := c.jenkins.GetJob(c.ctx, name)
+	if err != nil {
+		return fmt.Errorf("get job %s after sync: %w", name, err)
+	}
+
+	if j.IsEnabled() {
+		if _, err = job.Enable(c.ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s: enable skipped (%v), state already set in XML\n", name, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "  %s: enabled\n", name)
 		}
 	} else {
-		c.jenkins.UpdateJob(c.ctx, j.Name, xml)
+		if _, err = job.Disable(c.ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s: disable skipped (%v), state already set in XML\n", name, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "  %s: disabled\n", name)
+		}
 	}
-	job, err := c.jenkins.GetJob(c.ctx, j.Name)
-	if err != nil {
-		return fmt.Errorf("get job %s: %w", j.Name, err)
-	}
-	if j.IsEnabled() {
-		_, err = job.Enable(c.ctx)
-	} else {
-		_, err = job.Disable(c.ctx)
-	}
-	return err
+	return nil
 }
 
 func cmdSync() error {
@@ -90,13 +110,18 @@ func cmdSync() error {
 		return nil
 	}
 
+	succeeded := 0
+	failed := 0
 	for _, j := range jobs {
-		fmt.Printf("update job: %s\n", j.Name)
+		fmt.Printf("sync job: %s\n", j.Name)
 		if err := c.syncJob(j); err != nil {
-			return err
+			fmt.Fprintf(os.Stderr, "  FAILED: %v\n", err)
+			failed++
+			continue
 		}
+		succeeded++
 	}
-	fmt.Println("sync done.")
+	fmt.Printf("sync done: %d succeeded, %d failed\n", succeeded, failed)
 	return nil
 }
 

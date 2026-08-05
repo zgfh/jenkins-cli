@@ -99,6 +99,12 @@ func generateJobXML(j Job) string {
 
 	xml = strings.ReplaceAll(xml, "__BUILD_SCRIPT__", j.Config.BuildScript)
 
+	disabled := "false"
+	if !j.IsEnabled() {
+		disabled = "true"
+	}
+	xml = strings.ReplaceAll(xml, "<disabled>false</disabled>", "<disabled>"+disabled+"</disabled>")
+
 	if j.Config.AssignedNode != "" {
 		xml = strings.ReplaceAll(xml, "__CAN_ROAM__", "<canRoam>false</canRoam>\n  <assignedNode>"+j.Config.AssignedNode+"</assignedNode>")
 	} else {
