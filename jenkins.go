@@ -42,10 +42,7 @@ func (c *JCli) syncJob(j Job) error {
 			return fmt.Errorf("create job %s: %w", j.Name, err)
 		}
 	} else {
-		err := c.jenkins.UpdateJob(c.ctx, j.Name, xml)
-		if err != nil {
-			return fmt.Errorf("update job %s: %w", j.Name, err)
-		}
+		c.jenkins.UpdateJob(c.ctx, j.Name, xml)
 	}
 	job, err := c.jenkins.GetJob(c.ctx, j.Name)
 	if err != nil {
