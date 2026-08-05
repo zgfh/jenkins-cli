@@ -1,0 +1,49 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go vet ./...
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - darwin_amd64
+      - darwin_arm64
+      - windows_amd64
+    ldflags:
+      - -s -w -X main.Version={{ .Version }}
+    binary: jenkins-cli
+
+archives:
+  - format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - artifacts: archive
+
+brews:
+  - name: jenkins-cli
+    repository:
+      owner: zgfh
+      name: jenkins-cli
+      branch: homebrew
+      token: "{{ .Env.GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/zgfh/jenkins-cli"
+    description: "CLI tool for managing Jenkins jobs from the command line"
+    license: "MIT"
+    install: |
+      bin.install "jenkins-cli"
+    test: |
+      system "#{bin}/jenkins-cli", "version"
