@@ -1,8 +1,19 @@
 package main
 
-import "strings"
+import (
+	"bytes"
+	"encoding/xml"
+	"strings"
+)
 
-const gitJobXML = `<?xml version='1.1' encoding='UTF-8'?>
+// xmlEscape escapes a string for safe inclusion in XML text content.
+func xmlEscape(s string) string {
+	var buf bytes.Buffer
+	xml.EscapeText(&buf, []byte(s))
+	return buf.String()
+}
+
+const gitJobXML = `<?xml version="1.0" encoding="UTF-8"?>
 <project>
   <actions/>
   <description></description>
@@ -49,7 +60,7 @@ const gitJobXML = `<?xml version='1.1' encoding='UTF-8'?>
   <buildWrappers/>
 </project>`
 
-const cronJobXML = `<?xml version='1.1' encoding='UTF-8'?>
+const cronJobXML = `<?xml version="1.0" encoding="UTF-8"?>
 <project>
   <actions/>
   <description></description>
@@ -97,7 +108,7 @@ func generateJobXML(j Job) string {
 		xml = strings.ReplaceAll(xml, "__CRON__", cron)
 	}
 
-	xml = strings.ReplaceAll(xml, "__BUILD_SCRIPT__", j.Config.BuildScript)
+	xml = strings.ReplaceAll(xml, "__BUILD_SCRIPT__", xmlEscape(j.Config.BuildScript))
 
 	disabled := "false"
 	if !j.IsEnabled() {

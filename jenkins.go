@@ -1,19 +1,328 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
-
-	"github.com/bndr/gojenkins"
 )
 
+// JenkinsClient uses direct HTTP API calls instead of gojenkins SDK.
+// gojenkins SDK has issues parsing HTML responses that Jenkins returns
+// for some endpoints (createItem, enable, disable, doDelete).
+type JenkinsClient struct {
+	baseURL    string
+	user       string
+	password   string
+	crumbField string
+	crumbValue string
+	client     *http.Client
+}
+
+func newJenkinsClient(apiURL, user, password string) (*JenkinsClient, error) {
+	jar, _ := cookiejar.New(nil)
+	jc := &JenkinsClient{
+		baseURL:  strings.TrimRight(apiURL, "/"),
+		user:     user,
+		password: password,
+		client: &http.Client{
+			Jar:     jar,
+			Timeout: 30 * time.Second,
+		},
+	}
+	if err := jc.init(); err != nil {
+		return nil, fmt.Errorf("connect to Jenkins %s: %w", apiURL, err)
+	}
+	return jc, nil
+}
+
+func (c *JenkinsClient) init() error {
+	// Fetch CSRF crumb — this also authenticates and stores the session cookie
+	if err := c.fetchCrumb2(); err != nil {
+		return fmt.Errorf("connect to Jenkins %s: %w", c.baseURL, err)
+	}
+	return nil
+}
+
+func (c *JenkinsClient) fetchCrumb() {}
+
+func (c *JenkinsClient) fetchCrumb2() error {
+	resp, err := c.do("GET", "/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb)", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	parts := strings.SplitN(string(data), ":", 2)
+	if len(parts) == 2 {
+		c.crumbField = parts[0]
+		c.crumbValue = parts[1]
+	}
+	return nil
+}
+
+func (c *JenkinsClient) do(method, path string, body io.Reader) (*http.Response, error) {
+	return c.doWithTimeout(method, path, body, 0)
+}
+
+// doWithTimeout 与 do 相同，但可指定超时（0 表示用默认 client 超时 30s）。
+// 用于删除等耗时操作：Jenkins 同步清理大量构建历史会超过默认 30s，导致误报超时。
+func (c *JenkinsClient) doWithTimeout(method, path string, body io.Reader, timeout time.Duration) (*http.Response, error) {
+	req, err := http.NewRequest(method, c.baseURL+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(c.user, c.password)
+	if c.crumbField != "" && c.crumbValue != "" && method != "GET" {
+		req.Header.Set(c.crumbField, c.crumbValue)
+	}
+	if method == "POST" && body != nil {
+		req.Header.Set("Content-Type", "application/xml")
+	}
+	client := c.client
+	if timeout > 0 {
+		client = &http.Client{Jar: c.client.Jar, Timeout: timeout}
+	}
+	return client.Do(req)
+}
+
+func (c *JenkinsClient) doPost(path string, body io.Reader) (int, error) {
+	resp, err := c.do("POST", path, body)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+func (c *JenkinsClient) doGet(path string) ([]byte, error) {
+	resp, err := c.do("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+// hasJob checks if a job exists on the Jenkins server.
+func (c *JenkinsClient) hasJob(name string) bool {
+	resp, err := c.do("GET", "/job/"+url.PathEscape(name)+"/api/json", nil)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode < 400
+}
+
+// Server returns the base URL.
+func (c *JenkinsClient) Server() string {
+	return c.baseURL
+}
+
+// --- Job CRUD ---
+
+func (c *JenkinsClient) createJob(name, xml string) error {
+	resp, err := c.do("POST", "/createItem?name="+url.QueryEscape(name), strings.NewReader(xml))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// Jenkins returns 200 with HTML on success, 400/500 with error page
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 500)]))
+	}
+	return nil
+}
+
+func (c *JenkinsClient) updateJob(name, xml string) error {
+	code, err := c.doPost("/job/"+url.PathEscape(name)+"/config.xml", strings.NewReader(xml))
+	if err != nil {
+		return err
+	}
+	if code >= 400 {
+		return fmt.Errorf("HTTP %d", code)
+	}
+	return nil
+}
+
+func (c *JenkinsClient) getJobConfig(name string) (string, error) {
+	data, err := c.doGet("/job/" + url.PathEscape(name) + "/config.xml")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (c *JenkinsClient) deleteJob(name string) error {
+	// 删除大量构建历史的 job 很慢（Jenkins 同步清理构建记录），用长超时避免误报超时
+	resp, err := c.doWithTimeout("POST", "/job/"+url.PathEscape(name)+"/doDelete", nil, 10*time.Minute)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// 302 redirect 由 http.Client 自动跟随，最终 200；404 表示 job 不存在
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body[:min(len(body), 300)]))
+	}
+	return nil
+}
+
+func (c *JenkinsClient) enableJob(name string) error {
+	code, err := c.doPost("/job/"+url.PathEscape(name)+"/enable", nil)
+	if err != nil {
+		return err
+	}
+	if code >= 400 && code != 302 {
+		return fmt.Errorf("HTTP %d", code)
+	}
+	return nil
+}
+
+func (c *JenkinsClient) disableJob(name string) error {
+	code, err := c.doPost("/job/"+url.PathEscape(name)+"/disable", nil)
+	if err != nil {
+		return err
+	}
+	if code >= 400 && code != 302 {
+		return fmt.Errorf("HTTP %d", code)
+	}
+	return nil
+}
+
+func (c *JenkinsClient) buildJob(name string) error {
+	code, err := c.doPost("/job/"+url.PathEscape(name)+"/build", nil)
+	if err != nil {
+		return err
+	}
+	// 201 Created is expected
+	if code != 201 && code >= 400 {
+		return fmt.Errorf("HTTP %d", code)
+	}
+	return nil
+}
+
+// --- Data types ---
+
+type jenkinsInnerJob struct {
+	Name  string `json:"name"`
+	Color string `json:"color"`
+}
+
+type jenkinsJobList struct {
+	Jobs []jenkinsInnerJob `json:"jobs"`
+}
+
+type jenkinsJobDetail struct {
+	Name  string `json:"name"`
+	Color string `json:"color"`
+}
+
+type jenkinsBuildID struct {
+	Number int64 `json:"number"`
+}
+
+type jenkinsBuildIDs struct {
+	Builds []jenkinsBuildID `json:"builds"`
+}
+
+type jenkinsBuild struct {
+	Number    int64  `json:"number"`
+	Result    string `json:"result"`
+	Duration  int64  `json:"duration"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+// --- Query methods ---
+
+func (c *JenkinsClient) getAllJobNames() ([]jenkinsInnerJob, error) {
+	data, err := c.doGet("/api/json?tree=jobs[name,color]")
+	if err != nil {
+		return nil, err
+	}
+	var list jenkinsJobList
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, err
+	}
+	return list.Jobs, nil
+}
+
+func (c *JenkinsClient) getAllBuildIDs(name string) ([]jenkinsBuildID, error) {
+	data, err := c.doGet("/job/" + url.PathEscape(name) + "/api/json?tree=builds[number]")
+	if err != nil {
+		return nil, err
+	}
+	var ids jenkinsBuildIDs
+	if err := json.Unmarshal(data, &ids); err != nil {
+		return nil, err
+	}
+	return ids.Builds, nil
+}
+
+func (c *JenkinsClient) getBuild(name string, number int64) (*jenkinsBuild, error) {
+	path := fmt.Sprintf("/job/%s/%d/api/json", url.PathEscape(name), number)
+	data, err := c.doGet(path)
+	if err != nil {
+		return nil, err
+	}
+	var b jenkinsBuild
+	if err := json.Unmarshal(data, &b); err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+func (c *JenkinsClient) getLastBuild(name string) (*jenkinsBuild, error) {
+	data, err := c.doGet("/job/" + url.PathEscape(name) + "/lastBuild/api/json")
+	if err != nil {
+		return nil, err
+	}
+	var b jenkinsBuild
+	if err := json.Unmarshal(data, &b); err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+func (c *JenkinsClient) getConsoleOutput(name string, number int64) (string, error) {
+	path := fmt.Sprintf("/job/%s/%d/consoleText", url.PathEscape(name), number)
+	data, err := c.doGet(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (c *JenkinsClient) getJob(name string) (*jenkinsJobDetail, error) {
+	data, err := c.doGet("/job/" + url.PathEscape(name) + "/api/json?tree=name,color")
+	if err != nil {
+		return nil, err
+	}
+	var j jenkinsJobDetail
+	if err := json.Unmarshal(data, &j); err != nil {
+		return nil, err
+	}
+	return &j, nil
+}
+
+// ========== CLI Command Implementations ==========
+
 type JCli struct {
-	jenkins *gojenkins.Jenkins
-	ctx     context.Context
+	jenkins *JenkinsClient
 }
 
 func newJCli() (*JCli, error) {
@@ -21,56 +330,44 @@ func newJCli() (*JCli, error) {
 		return nil, err
 	}
 
-	ctx := context.Background()
-	jenkins := gojenkins.CreateJenkins(nil, getAPI(), getUser(), getPassword())
-	_, err := jenkins.Init(ctx)
+	jenkins, err := newJenkinsClient(getAPI(), getUser(), getPassword())
 	if err != nil {
-		return nil, fmt.Errorf("connect to Jenkins %s: %w", getAPI(), err)
+		return nil, err
 	}
-	return &JCli{jenkins: jenkins, ctx: ctx}, nil
-}
-
-func (c *JCli) hasJob(name string) bool {
-	_, err := c.jenkins.GetJob(c.ctx, name)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  [debug] hasJob(%s) error: %v, assuming not found\n", name, err)
-		return false
-	}
-	return true
+	return &JCli{jenkins: jenkins}, nil
 }
 
 func (c *JCli) syncJob(j Job) error {
 	xml := generateJobXML(j)
 	name := j.Name
 
-	if c.hasJob(name) {
-		fmt.Fprintf(os.Stderr, "  %s: updating existing job...\n", name)
-		c.jenkins.UpdateJob(c.ctx, name, xml)
-		fmt.Fprintf(os.Stderr, "  %s: config updated\n", name)
-	} else {
-		fmt.Fprintf(os.Stderr, "  %s: creating new job...\n", name)
-		_, err := c.jenkins.CreateJob(c.ctx, xml, name)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  %s: create failed (%v), trying update...\n", name, err)
-			c.jenkins.UpdateJob(c.ctx, name, xml)
+	exists := c.jenkins.hasJob(name)
+	if !exists {
+		fmt.Fprintf(os.Stderr, "  %s: creating new job (len=%d)...\n", name, len(xml))
+		if err := c.jenkins.createJob(name, xml); err != nil {
+			return fmt.Errorf("create job: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "  %s: job created/updated\n", name)
+		fmt.Fprintf(os.Stderr, "  %s: created\n", name)
+	} else {
+		fmt.Fprintf(os.Stderr, "  %s: updating config...\n", name)
 	}
 
-	job, err := c.jenkins.GetJob(c.ctx, name)
-	if err != nil {
-		return fmt.Errorf("get job %s after sync: %w", name, err)
+	// Always reconfig (same as Python approach)
+	if err := c.jenkins.updateJob(name, xml); err != nil {
+		return fmt.Errorf("update job: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "  %s: config updated\n", name)
 
+	// Enable/Disable
 	if j.IsEnabled() {
-		if _, err = job.Enable(c.ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "  %s: enable skipped (%v), state already set in XML\n", name, err)
+		if err := c.jenkins.enableJob(name); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s: enable failed (job will use XML state): %v\n", name, err)
 		} else {
 			fmt.Fprintf(os.Stderr, "  %s: enabled\n", name)
 		}
 	} else {
-		if _, err = job.Disable(c.ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "  %s: disable skipped (%v), state already set in XML\n", name, err)
+		if err := c.jenkins.disableJob(name); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s: disable failed (job will use XML state): %v\n", name, err)
 		} else {
 			fmt.Fprintf(os.Stderr, "  %s: disabled\n", name)
 		}
@@ -83,7 +380,7 @@ func cmdSync() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Connected to Jenkins %s\n", c.jenkins.Server)
+	fmt.Printf("Connected to Jenkins %s\n", c.jenkins.Server())
 
 	args := os.Args[2:]
 	jobs, err := parseConfigs()
@@ -132,11 +429,7 @@ func cmdStatus() error {
 		if err != nil {
 			return err
 		}
-		job, err := c.jenkins.GetJob(c.ctx, args[0])
-		if err != nil {
-			return fmt.Errorf("get job %s: %w", args[0], err)
-		}
-		xml, err := job.GetConfig(c.ctx)
+		xml, err := c.jenkins.getJobConfig(args[0])
 		if err != nil {
 			return fmt.Errorf("get config for %s: %w", args[0], err)
 		}
@@ -185,7 +478,7 @@ func cmdHistory() error {
 }
 
 func (c *JCli) jobHistory(name string) error {
-	buildIDs, err := c.jenkins.GetAllBuildIds(c.ctx, name)
+	buildIDs, err := c.jenkins.getAllBuildIDs(name)
 	if err != nil {
 		return fmt.Errorf("get builds for %s: %w", name, err)
 	}
@@ -202,17 +495,17 @@ func (c *JCli) jobHistory(name string) error {
 		if i >= limit {
 			break
 		}
-		build, err := c.jenkins.GetBuild(c.ctx, name, b.Number)
+		build, err := c.jenkins.getBuild(name, b.Number)
 		if err != nil {
 			fmt.Printf("%-6d %-12s\n", b.Number, "error")
 			continue
 		}
-		result := build.GetResult()
+		result := build.Result
 		if result == "" {
 			result = "RUNNING"
 		}
-		dur := fmt.Sprintf("%.0fs", build.GetDuration()/1000)
-		ts := build.GetTimestamp().In(time.FixedZone("CST", 8*3600)).Format("01-02 15:04:05")
+		dur := fmt.Sprintf("%.0fs", float64(build.Duration)/1000)
+		ts := time.UnixMilli(build.Timestamp).In(time.FixedZone("CST", 8*3600)).Format("01-02 15:04:05")
 		fmt.Printf("%-6d %-12s %-12s %s\n", b.Number, result, dur, ts)
 	}
 	return nil
@@ -227,22 +520,17 @@ func (c *JCli) allHistory() error {
 	fmt.Println(stringsRepeat("-", 70))
 
 	for _, j := range jobs {
-		job, err := c.jenkins.GetJob(c.ctx, j.Name)
-		if err != nil {
-			fmt.Printf("%-30s %-10s %s\n", j.Name, "error", err)
-			continue
-		}
-		build, err := job.GetLastBuild(c.ctx)
+		build, err := c.jenkins.getLastBuild(j.Name)
 		if err != nil || build == nil {
 			fmt.Printf("%-30s %-10s %-12s %s\n", j.Name, "-", "no builds", "-")
 			continue
 		}
-		result := build.GetResult()
+		result := build.Result
 		if result == "" {
 			result = "?"
 		}
-		ts := build.GetTimestamp().In(time.FixedZone("CST", 8*3600)).Format("01-02 15:04:05")
-		fmt.Printf("%-30s #%-9d %-12s %s\n", j.Name, build.GetBuildNumber(), result, ts)
+		ts := time.UnixMilli(build.Timestamp).In(time.FixedZone("CST", 8*3600)).Format("01-02 15:04:05")
+		fmt.Printf("%-30s #%-9d %-12s %s\n", j.Name, build.Number, result, ts)
 	}
 	return nil
 }
@@ -262,23 +550,19 @@ func cmdLog() error {
 	if len(os.Args) >= 4 {
 		fmt.Sscanf(os.Args[3], "%d", &buildNum)
 	} else {
-		job, err := c.jenkins.GetJob(c.ctx, jobName)
-		if err != nil {
-			return fmt.Errorf("get job %s: %w", jobName, err)
-		}
-		build, err := job.GetLastBuild(c.ctx)
+		build, err := c.jenkins.getLastBuild(jobName)
 		if err != nil || build == nil {
 			return fmt.Errorf("%s has no builds", jobName)
 		}
-		buildNum = build.GetBuildNumber()
+		buildNum = build.Number
 	}
 
 	fmt.Printf("=== %s #%d console ===\n", jobName, buildNum)
-	build, err := c.jenkins.GetBuild(c.ctx, jobName, buildNum)
+	output, err := c.jenkins.getConsoleOutput(jobName, buildNum)
 	if err != nil {
 		return fmt.Errorf("get build: %w", err)
 	}
-	fmt.Println(build.GetConsoleOutput(c.ctx))
+	fmt.Println(output)
 	return nil
 }
 
@@ -292,7 +576,7 @@ func cmdBuild() error {
 		return err
 	}
 	jobName := os.Args[2]
-	if _, err := c.jenkins.BuildJob(c.ctx, jobName, nil); err != nil {
+	if err := c.jenkins.buildJob(jobName); err != nil {
 		return fmt.Errorf("build %s: %w", jobName, err)
 	}
 	fmt.Printf("triggered: %s\n", jobName)
@@ -304,7 +588,7 @@ func cmdList() error {
 	if err != nil {
 		return err
 	}
-	jobs, err := c.jenkins.GetAllJobNames(c.ctx)
+	jobs, err := c.jenkins.getAllJobNames()
 	if err != nil {
 		return fmt.Errorf("list jobs: %w", err)
 	}
@@ -331,11 +615,7 @@ func cmdEnable() error {
 		return err
 	}
 	name := os.Args[2]
-	job, err := c.jenkins.GetJob(c.ctx, name)
-	if err != nil {
-		return fmt.Errorf("get job %s: %w", name, err)
-	}
-	if _, err := job.Enable(c.ctx); err != nil {
+	if err := c.jenkins.enableJob(name); err != nil {
 		return err
 	}
 	fmt.Printf("enabled: %s\n", name)
@@ -352,11 +632,7 @@ func cmdDisable() error {
 		return err
 	}
 	name := os.Args[2]
-	job, err := c.jenkins.GetJob(c.ctx, name)
-	if err != nil {
-		return fmt.Errorf("get job %s: %w", name, err)
-	}
-	if _, err := job.Disable(c.ctx); err != nil {
+	if err := c.jenkins.disableJob(name); err != nil {
 		return err
 	}
 	fmt.Printf("disabled: %s\n", name)
@@ -373,7 +649,7 @@ func cmdDelete() error {
 		return err
 	}
 	name := os.Args[2]
-	if _, err := c.jenkins.DeleteJob(c.ctx, name); err != nil {
+	if err := c.jenkins.deleteJob(name); err != nil {
 		return err
 	}
 	fmt.Printf("deleted: %s\n", name)
@@ -385,7 +661,7 @@ func cmdDiff() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Connected to Jenkins %s\n", c.jenkins.Server)
+	fmt.Printf("Connected to Jenkins %s\n", c.jenkins.Server())
 
 	args := os.Args[2:]
 	jobs, err := parseConfigs()
@@ -454,11 +730,15 @@ func (c *JCli) diffJob(j Job) error {
 }
 
 func (c *JCli) getRemoteXML(name string) (string, error) {
-	job, err := c.jenkins.GetJob(c.ctx, name)
+	xml, err := c.jenkins.getJobConfig(name)
 	if err != nil {
 		return "", err
 	}
-	return job.GetConfig(c.ctx)
+	// Jenkins returns HTML error page (not 404) for non-existent jobs
+	if strings.HasPrefix(strings.TrimSpace(xml), "<") && !strings.HasPrefix(strings.TrimSpace(xml), "<?xml") {
+		return "", fmt.Errorf("404 job %s not found", name)
+	}
+	return xml, nil
 }
 
 func unifiedDiff(old, new, name string) string {
@@ -476,7 +756,6 @@ func unifiedDiff(old, new, name string) string {
 
 	cmd := exec.Command("diff", "-u", "--label", "jenkins/"+name, oldFile, "--label", "local/"+name, newFile)
 	out, _ := cmd.Output()
-	// diff exits with code 1 when files differ
 	if len(out) == 0 {
 		return ""
 	}

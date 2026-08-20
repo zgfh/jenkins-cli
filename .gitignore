@@ -1,3 +1,4 @@
 *.swp
 jenkins-cli
+jenkins-cli-linux
 .DS_Store
